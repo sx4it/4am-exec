@@ -6,11 +6,15 @@ require 'rubygems'
 require 'redis'
 require 'net/ssh'
 require 'json'
+require 'thread'
 
 $sub = Redis.new(:timeout => 10, :host => 'dev2.sx4it.com', :port => 42163)
 $r = Redis.new(:timeout => 10, :host => 'dev2.sx4it.com', :port => 42163)
+$stop = Redis.new(:timeout => 10, :host => 'dev2.sx4it.com', :port => 42163)
 
-def execute(host, request)
+$running_cmds = {}
+
+def execute(host, request, msg)
   # Debug: Host => {script}
   puts "### Execution ###\n"
   puts host + " => {\n" + request['script'] + "\n}"
@@ -19,21 +23,28 @@ def execute(host, request)
     channel = ssh.open_channel do |ch|
       ch.exec(request['script']) do |ch, success|
         raise "could not execute command" unless success
-        
+
         # "on_data" is called when the process writes something to stdout
 
         ch.on_data do |c, data|
-          request['log'] += data
+          if data
+            request['log'] += data
+          end
           puts data
+          $r.set msg, JSON.dump(request)
         end
-        
+
         # "on_extended_data" is called when the process writes something to stderr
         ch.on_extended_data do |c, type, data|
-          puts data
+          if data
+            request['log'] += data
+          end
+          $r.set msg, JSON.dump(request)
         end
-        
+
         ch.on_close {
-          puts "Done !"
+          request['log'] += "--Connection Closed--\n"
+          $r.set msg, JSON.dump(request)
         }
 
         # To retrieve the status code of the last command executed
@@ -43,22 +54,40 @@ def execute(host, request)
 
       end
     end
-    request['status'] = "finished"
   end
 end
 
 $sub.subscribe('4am-command', 'new') do |on|
-  on.message do |channel, msg|    
-    if $r.exists(msg)
+  on.message do |channel, msg|
+    if msg.split(':').last == "stop"
+    key = msg.split(':')[0..2].join(':')
+      if $running_cmds.include? key
+        $running_cmds[key].exit
+        if $r.exists key
+          request = JSON.parse($r.get(key))
+          request['status'] = 'killed'
+          request['status_code'] = 130
+          request['log'] += "--killed by user--\n"
+          $r.set key, JSON.dump(request)
+        end
+      end
+    elsif $r.exists(msg)
       puts "#{msg}"
       request = JSON.parse($r.get(msg))
-      puts request.inspect      
-      i = 0
-      while (i < request['hosts'].size)
-        execute(request['hosts'][i], request)
-        $r.set "cmd-host:" + "#{request['hosts_id'][i]}" + ":" + "#{request['id']}", JSON.dump(request)
-        i = i + 1
-      end      
+      puts request.inspect
+      request['hosts'].each do |h|
+        $running_cmds[msg] = Thread.new {
+          request['status'] = 'running...'
+          request['log'] += "--launching command--\n"
+          request['log'] += "--on host #{h}--\n"
+          request['log'] += "$ #{request["script"]}\n"
+          $r.set msg, JSON.dump(request)
+          execute(h, request, msg)
+          request['status'] = "finished"
+          $r.set msg, JSON.dump(request)
+          $running_cmds.delete msg
+        }
+      end
     else
       puts "#{msg} does not exist"
     end
