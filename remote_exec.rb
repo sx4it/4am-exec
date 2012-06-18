@@ -17,7 +17,7 @@ $running_cmds = {}
 def execute(host, request, msg)
   # Debug: Host => {script}
   puts "### Execution ###\n"
-  # puts host['ip'] + " " + host['port'] + " => {\n" + request['script'] + "\n}"
+  puts host['ip'] + " " + host['port'] + " => {\n" + request['script'] + "\n}"
   puts "### fin Execution ###\n"  
   # Start SSH
   Net::SSH.start(
