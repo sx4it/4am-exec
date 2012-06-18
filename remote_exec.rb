@@ -64,11 +64,14 @@ $sub.subscribe('4am-command', 'new') do |on|
       if $running_cmds.include? key
         $running_cmds[key].exit
         if $r.exists key
-          request = JSON.parse($r.get(key))
-          request['status'] = 'killed'
-          request['status_code'] = 130
-          request['log'] += "--killed by user--\n"
-          $r.set key, JSON.dump(request)
+          resp = $r.get(key)
+          unless resp.nil?
+            request = JSON.parse(resp)
+            request['status'] = 'killed'
+            request['status_code'] = 130
+            request['log'] += "--killed by user--\n"
+            $r.set key, JSON.dump(request)
+          end
         end
       end
     elsif $r.exists(msg)
