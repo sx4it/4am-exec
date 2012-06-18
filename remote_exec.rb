@@ -17,15 +17,21 @@ $running_cmds = {}
 def execute(host, request, msg)
   # Debug: Host => {script}
   puts "### Execution ###\n"
-  puts host + " => {\n" + request['script'] + "\n}"
+  # puts host['ip'] + " " + host['port'] + " => {\n" + request['script'] + "\n}"
+  puts "### fin Execution ###\n"  
   # Start SSH
-  Net::SSH.start(host, "tata", :password => "tata", :port => 22163) do |ssh|
+  Net::SSH.start(
+                 host['ip'],
+                 "root",
+                 :host_key => "ssh-rsa",
+                 :keys => [File.expand_path("~/.ssh/id_remote_exec_4am_rsa")],
+                 :port => host['port']
+   ) do |ssh|
     channel = ssh.open_channel do |ch|
       ch.exec(request['script']) do |ch, success|
         raise "could not execute command" unless success
 
         # "on_data" is called when the process writes something to stdout
-
         ch.on_data do |c, data|
           if data
             request['log'] += data
@@ -82,7 +88,7 @@ $sub.subscribe('4am-command', 'new') do |on|
         $running_cmds[msg] = Thread.new {
           request['status'] = 'running...'
           request['log'] += "--launching command--\n"
-          request['log'] += "--on host #{h}--\n"
+          request['log'] += "--on host #{h['ip']}:#{h['port']}--\n"
           request['log'] += "$ #{request["script"]}\n"
           $r.set msg, JSON.dump(request)
           execute(h, request, msg)
