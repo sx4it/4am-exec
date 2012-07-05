@@ -17,15 +17,18 @@ $running_cmds = {}
 def execute(host, request, msg)
   # Debug: Host => {script}
   puts "### Execution ###\n"
-  # puts host['ip'] + " " + host['port'] + " => {\n" + request['script'] + "\n}"
-  puts "### fin Execution ###\n"  
+  request['script'].delete!("\C-M")
+  puts "{\n" + request['script'] + "\n}"
+
+  puts "### fin Execution ###\n"
+
   # Start SSH
   Net::SSH.start(
                  host['ip'],
                  "root",
                  :host_key => "ssh-rsa",
-                 :keys => [File.expand_path("~/.ssh/id_remote_exec_4am_rsa")],
-                 :port => host['port']
+                 :keys => [File.expand_path("4am-rsa")],
+                 :port => host['port'].to_i
    ) do |ssh|
     channel = ssh.open_channel do |ch|
       ch.exec(request['script']) do |ch, success|
