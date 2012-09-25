@@ -1,0 +1,16 @@
+GEM
+  remote: http://rubygems.org/
+  specs:
+    jruby-pageant (1.1.1)
+    json (1.7.5)
+    net-ssh (2.6.0)
+      jruby-pageant (>= 1.1.1)
+    redis (3.0.1)
+
+PLATFORMS
+  ruby
+
+DEPENDENCIES
+  json
+  net-ssh
+  redis
