@@ -2,17 +2,92 @@
 require 'net/ssh'
 require 'redis'
 
-class ExecutionWorker
+# FIXME The logger should be reconfigured
 
-  def initialize(redishost, redisport, uid, workerid, jobs)
+class SSHWorker
+  DISCOVERYTIMEOUT = 20
+  attr_reader :busy
+  attr_writer :kill
+
+  class HostKeyVerifierStore
+    # This class is a simple hack to get the remote host key
+    attr_reader :remote_key
+  
+    def verify(arguments)
+      # This method only store the remote public key as an instance variable
+      @remote_key = arguments[:key]
+      false
+    end
+  end
+
+  def initialize(redishost, redisport, uid, job)
     # We create a new connection to redis
     # 
     @redishost = redishost
     @redisport = redisport
     @uid = uid
-    @workerid = workerid
     @r = Redis.new(:host => redishost, :port => redisport)
-    @jobs = jobs
+    @job = job
+    @busy = false
+  end
+
+  def run
+    loop do
+      cmd = @job.pop
+      @busy = cmd
+      begin
+        if request = lock_command(cmd)
+          execute request['hosts'][0], request, cmd
+          request['status'] = "finished"
+          @r.set cmd, JSON.dump(request)
+        end
+      rescue => err
+        $logger.error("#{$PROGRAM_NAME}: The command execution failed : #{err.inspect} #{err} #{caller}")
+        if resp = @r.get(cmd)
+          request = JSON.parse resp
+          request['status'] = 'failed'
+          request['status_code'] = 131
+          request['log'] += "--internal error--\n"
+          @r.set cmd, JSON.dump(request)
+        end
+      end
+      @busy = false
+    end
+  end
+
+  private
+  def lock_command(key)
+    # This method attempt to lock the command for execution
+    $logger.debug("Worker thread #{@uid} attempting lock for command '#{key}'.")
+    @r.watch key
+    request = JSON.parse(@r.get(key))
+    if request['locked']
+      $logger.debug("Worker thread #{@uid} : command '#{key}' is already locked.")
+      @r.unwatch
+      return nil
+    end
+    request['locked'] = @uid
+    request['status'] = 'processing'
+    request['processing_start'] = Time.now
+    @r.multi
+    @r.set key, JSON.dump(request)
+    if @r.exec
+      $logger.info("Worker thread #{@uid} locked command '#{key}'.")
+      request
+    else
+      $logger.debug("Worker thread #{@uid} : command '#{key}' has been modified, aborting lock.")
+      nil
+    end
+  end
+
+  def get_host_key(ip, port=22, timeout=DISCOVERYTIMEOUT)
+    options[:port] = port
+    options[:timeout] = timeout
+    options[:paranoid] = HostKeyVerifierStore.new
+    #FIXME logger
+    #FIXME the exception could be abnormal if the connection failed
+    Net::SSH::Transport::Session.new(ip, options) rescue Net::SSH::Exception
+    options[:paranoid].remote_key
   end
 
   def execute(host, request, msg)
@@ -62,53 +137,69 @@ class ExecutionWorker
           end
         end # End ch.exec
       end # End channel
+      ssh.loop
     end # End ssh connection
     $logger.info "End execution of [#{request['script']}]"
   end
+end
 
-  def lock_cmd(key)
-    # This method attempt to lock the command for execution
-    Thread.current['cmd'] = key
-    @r.watch key
-    request = JSON.parse(@r.get(key))
-    if request['locked']
-      Thread.current['cmd'] = ''
-      @r.unwatch
-      return nil
-    end
-    request['locked'] = @uid
-    request['status'] = 'processing'
-    request['processing_start'] = Time.now
-    @r.multi
-    @r.set key, JSON.dump(request)
-    if @r.exec
-      $logger.debug("Worker thread #{@workerid} locked command with key #{key} for execution.")
-      request
-    else
-      Thread.current['cmd'] = ''
-      nil
-    end
+class ExecutionWorker
+  COMMANDKILLED = 1
+  WORKERKILLED = 2
+  SETWORKERREG = '4am-workers'
+  def initialize(redishost, redisport, uid)
+    # We create a new connection to redis and add the worker uid to a specific set
+    # to signal our presence
+    # The steps of the initialization are as follow :
+    #   1. We create a new connection to redis
+    #   2. We register the worker uid to a specific set to signal our presence.
+    #     The worker uid is then also used to lock the commands.
+    @redishost = redishost
+    @redisport = redisport
+    @uid = uid
+    @r = Redis.new(:host => redishost, :port => redisport)
+    raise "UID is already used." unless @r.sadd(SETWORKERREG, uid)
+    @registered = true
+    $logger.info("Successfully registred woker as %s\n" % uid)
   end
 
   def run
-    while true
-      cmd = @jobs.pop
+    # As the subscribe method implemented by the redis gem blocks the whole thread,
+    # we create a dedicated thread to execute the commands.
+    @job = Queue.new
+    @sshworker = SSHWorker.new(@redishost, @redisport, @uid, @job)
+    @t = Thread.new do
       begin
-        request = lock_cmd(cmd)
-        execute(request['hosts'][0], request, cmd)
-        request['status'] = "finished"
-        @r.set cmd, JSON.dump(request)
+        @sshworker.run
       rescue => err
-        $logger.error("#{$PROGRAM_NAME}: The command execution failed : #{err.inspect} #{err} #{caller}")
-        if resp = @r.get(cmd)
-          request = JSON.parse resp
-          request['status'] = 'failed'
-          request['status_code'] = 131
-          request['log'] += "--internal error--\n"
-          @r.set cmd, JSON.dump(request)
+        $logger.fatal("#{$PROGRAM_NAME}: The SSHWorker thread #{@uid} died : #{err.inspect} #{err} #{caller}")
+        return 128
+      end
+    end
+    @r.subscribe('4am-command', '4am-command-stop', '4am-workers-stop') do |on|
+      on.message do |channel, msg|
+        $logger.info("Received #{msg} on channel #{channel}")
+        if channel == '4am-command'
+          @job << msg unless @sshworker.busy
+        elsif channel == '4am-command-stop' and msg == @sshworker.busy
+          @sshworker.kill = COMMANDKILLED
+        elsif channel == '4am-workers-stop' and msg == @uid
+          @sshworker.kill = WORKERKILLED
+          @r.unsubscribe('4am-command', '4am-command-stop', '4am-workers')
         end
       end
     end
   end
 
+  def shutdown
+    # Clean shutdown
+    # FIXME We need to properly shutdown the ssh thread
+    if @registered
+      $logger.error("Unregistering workermanager #{@uid} failed.") unless @r.srem(SETWORKERREG, @uid)
+      @registered = false
+    end
+    @r.quit if @r
+  end
+
 end
+

@@ -1,6 +1,8 @@
 #!/usr/bin/env ruby
 
 # redis-cli -h dev2.sx4it.com -p 42163
+# Clean commands
+# redis-cli keys 'cmd-host:*' | xargs redis-cli del
 
 require 'rubygems'
 require 'redis'
@@ -20,6 +22,7 @@ class Optparse4amexec
     options[:loglevel] = Logger::WARN
     options[:port] = 6379
     options[:host] = 'localhost'
+    options[:w] = 20
 
     opts = OptionParser.new do |opts|
       opts.on("-v", "--[no-]verbose", "Run verbosely") do |v|
@@ -40,8 +43,14 @@ class Optparse4amexec
         options[:host] = host
       end
 
-      opts.on(:REQUIRED, "-i", "--id ID", "Specify unique id") do |id|
+      opts.on("-i", "--id ID", "Specify unique id") do |id|
         options[:uid] = id
+      end
+
+      opts.on("-w", "--workers NB", OptionParser::DecimalInteger,
+              "Specify number of workers to launch") do |w|
+        raise OptionParser::InvalidOption.new "Worker should be a positive integer." if w < 0
+        options[:w] = w
       end
     end
     
@@ -53,7 +62,7 @@ class Optparse4amexec
         error = "The following option"
         error += " is" if missing.count == 1
         error += "s are" if missing.count > 1
-        error += " missing: #{missing.join(', ')}"                  #
+        error += " missing: #{missing.join(', ')}"
         STDERR.puts error
         STDERR.puts opts
         return nil
@@ -69,56 +78,64 @@ end
 
 
 class WorkerManager
-  THREADNB = 10
-  CHANWORKERREG = '4am-workers'
-  def initialize(redishost, redisport, uid)
+  WORKERNB = 10
+  def initialize(redishost, redisport, uid, workernb)
     @redishost = redishost
     @redisport = redisport
     @uid = uid
-    @redsub = Redis.new(:host => redishost, :port => redisport)
-    raise "UID is already used." unless @redsub.sadd(CHANWORKERREG, uid)
-    @registered = true
-    $logger.debug("Successfully registred woker as %s\n" % uid)
-    @jobs = Queue.new
-    @workers = []
-    THREADNB.times do |threadid|
-      @workers << Thread.new { start_worker(threadid) }
-      $logger.debug("Created worker thread #{threadid}.")
-    end
-  end
-
-  def shutdown
-    @workers.each { |w| w.kill }
-    @redsub.quit
-    if @registered
-      $logger.error("Unregistering workermanager #{@uid} failed.") unless @redsub.srem(CHANWORKERREG, @uid)
-    end
+    @workernb = workernb
+    @workers = Hash.new
   end
 
   def run
-    @redsub.subscribe('4am-command', '4am-command-stop') do |on|
-      on.message do |channel, msg|
-        $logger.info("Received #{msg} on channel #{channel}")
-        if channel == '4am-command'
-          @jobs << msg
-        elsif channel == '4am-command-stop'
-          stop_cmd(msg)
-        end
+    @workernb.times do |workerid|
+      pid = fork
+      id = "#{@uid}-#{workerid}"
+      if pid
+        @workers[id] = pid
+        $logger.info("Created worker process #{id}.")
+      else
+        exit! start_worker(id)
       end
     end
+    wait_for_workers
+  end
+
+  def shutdown
+    @workers.each do |id, pid|
+      kill "INT", pid rescue Errno::ESRCH
+    end
+    wait_for_workers
   end
 
   private
   def start_worker(id)
     begin
-      ExecutionWorker.new(@redishost, @redisport, @uid, id, @jobs).run
+      ew = ExecutionWorker.new(@redishost, @redisport, id)
+      $logger.info("Created ExecutionWorker #{id}.")
+      ew.run
+    rescue Interrupt
+      $logger.warn("Interrupt catched, worker is shutting down...")
+      128
     rescue => err
-      $logger.error("#{$PROGRAM_NAME}: The ExecutionWorker #{id} died : #{err.inspect} #{err}")
+      $logger.fatal("#{$PROGRAM_NAME}: The ExecutionWorker #{id} died : #{err.inspect} #{err} #{caller}")
+      128
+    ensure
+      ew.shutdown if ew
     end
   end
 
-  def stop_cmd(key)
-     $logger.warning("#{$PROGRAM_NAME}: Command stop not implemented.")
+  def wait_for_workers
+    @workers.size.times do
+      pid = Process.wait
+      wuid = @workers.key pid
+      @workers.delete wuid
+      $logger.debug("Worker process #{wuid} (#{pid}) stopped with status #{$?.exitstatus}.")
+    end
+  end
+
+#  def stop_cmd(key)
+#     $logger.warning("#{$PROGRAM_NAME}: Command stop not implemented.")
 #    @workers.each do |w|
 #      if w['cmd'] == key
 #        w.exit
@@ -131,16 +148,16 @@ class WorkerManager
 #        end
 #      end
 #    end
-  end
+#  end
 end
 
 def main
   options = Optparse4amexec.parse(ARGV)
-  exit 1 if options == nil
+  exit 1 unless options
   $logger = Logger.new(options[:logfile])
   $logger.sev_threshold = options[:loglevel]
   begin
-    wm = WorkerManager.new(options[:host], options[:port], options[:uid])
+    wm = WorkerManager.new(options[:host], options[:port], options[:uid], options[:w])
     wm.run
   rescue Redis::CannotConnectError => err
     $logger.fatal("#{$PROGRAM_NAME}: Redis connection error : %s\n" % err)
