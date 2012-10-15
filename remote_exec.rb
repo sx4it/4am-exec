@@ -133,22 +133,6 @@ class WorkerManager
       $logger.debug("Worker process #{wuid} (#{pid}) stopped with status #{$?.exitstatus}.")
     end
   end
-
-#  def stop_cmd(key)
-#     $logger.warning("#{$PROGRAM_NAME}: Command stop not implemented.")
-#    @workers.each do |w|
-#      if w['cmd'] == key
-#        w.exit
-#        if resp = @red.get(key)
-#            request = JSON.parse(resp)
-#            request['status'] = 'killed'
-#            request['status_code'] = 130
-#            request['log'] += "--killed by user--\n"
-#            @red.set key, JSON.dump(request)
-#        end
-#      end
-#    end
-#  end
 end
 
 def main
