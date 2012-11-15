@@ -20,6 +20,7 @@ class Optparse4amexec
     options.logfile = STDERR
     options.loglevel = Logger::WARN
     options.port = 6379
+    options.env = 'development'
     options.localhost = 'localhost'
 
     opts = OptionParser.new do |opts|
@@ -36,12 +37,17 @@ class Optparse4amexec
         options.port = port
       end
 
+      opts.on("-e", "--env ENV",
+              "Specify environment (default development)") do |env|
+        options.env= env
+      end
+
       opts.on("-H", "--host HOSTIP",
               "Specify host address (default localhost)") do |host|
         options.host = host
       end
     end
-    
+
     opts.parse!(args)
     options
   end
@@ -51,7 +57,8 @@ end
 
 class RemoteExec
 
-  def initialize(redishost, redisport)
+  def initialize(redishost, redisport, environment)
+    @environment = environment
     @redishost = redishost
     @redisport = redisport
     @redsub = Redis.new(:host => redishost, :port => redisport)
@@ -150,8 +157,13 @@ class RemoteExec
               if resp = @red.get(msg)
                 request = JSON.parse(resp)
                 request['status'] = 'failed'
-                request['status_code'] = 131
-                request['log'] += "--internal error--\n"
+                if err.errno != 0
+                  request['status_code'] = err.errno
+                  request['log'] += "--#{err}--\n"
+                else
+                  request['status_code'] = 131
+                  request['log'] += "--internal error--\n"
+                end
                 @red.set msg, JSON.dump(request)
               end
               @running_cmds.delete msg
@@ -165,7 +177,7 @@ class RemoteExec
   end
 
   def run
-    @redsub.subscribe('4am-command', 'new') do |on|
+    @redsub.subscribe("#{@environment}:4am-command", 'new') do |on|
       handle_message(on)
     end
   end
@@ -175,7 +187,7 @@ begin
   options = Optparse4amexec.parse(ARGV)
   $logger = Logger.new(options.logfile)
   $logger.sev_threshold = options.loglevel
-  RemoteExec.new(options.host, options.port).run
+  RemoteExec.new(options.host, options.port, options.env).run
 rescue OptionParser::MissingArgument => err
   $logger.fatal("#{$PROGRAM_NAME}: command line error : %s\n" % err)
   exit 1
